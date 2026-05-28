@@ -1,25 +1,36 @@
 """
 Backend API para búsqueda híbrida de cursos.
 Implementa: extracción de intención, filtrado duro por categoría y público,
-similitud semántica sobre título + descripción y soft boosting por nivel.
+similitud semántica con Qdrant sobre título + descripción y soft boosting por nivel.
+
+Arquitectura:
+- Persistencia: Qdrant Vector DB (colección "cursos_hobby")
+- Vectores: Asimétricos (título: 384 dims @ 70%, descripción: 384 dims @ 30%)
+- Distancia: Cosine similarity
+- Pipeline: Intención → Búsqueda Qdrant → Ponderación asimétrica → Soft Boosting → Ordenamiento
 """
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+from qdrant_client import QdrantClient
+from qdrant_client import models
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# SCHEMAS PYDANTIC
+# ============================================================================
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
@@ -43,7 +54,15 @@ class SearchResponse(BaseModel):
     cursos: List[CursoResponse]
 
 
-app = FastAPI(title="API de Búsqueda Híbrida", description="Motor de búsqueda con filtros lógicos y ranking semántico", version="1.2.0")
+# ============================================================================
+# CONFIGURACIÓN GLOBAL
+# ============================================================================
+
+app = FastAPI(
+    title="API de Búsqueda Híbrida",
+    description="Motor de búsqueda con filtros lógicos, ranking semántico y persistencia en Qdrant",
+    version="2.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,30 +72,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-cursos_data: List[dict] = []
+# Variables globales
+qdrant_client: Optional[QdrantClient] = None
 model: Optional[SentenceTransformer] = None
+cursos_data: List[dict] = []
 categorias_disponibles: List[str] = []
 
-# Embeddings separados por campo para el pipeline híbrido
-embeddings_titulo: Optional[np.ndarray] = None
-embeddings_descripcion: Optional[np.ndarray] = None
+# Configuración Qdrant (lee desde variables de entorno)
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
+COLLECTION_NAME = "cursos_hobby"
+VECTOR_SIZE = 384  # all-MiniLM-L6-v2 dimension
 
+# Ponderación asimétrica para búsqueda semántica
 TITLE_WEIGHT = 0.70
 DESCRIPTION_WEIGHT = 0.30
 MIN_TITLE_SIMILARITY = 0.35
 
+# Identificadores de campos vectoriales en Qdrant
+TITLE_VECTOR_NAME = "titulo_vector"
+DESCRIPTION_VECTOR_NAME = "descripcion_vector"
 
-def cargar_datos() -> List[dict]:
-    data_path = Path(__file__).parent / "data.json"
-    if not data_path.exists():
-        raise FileNotFoundError(f"El archivo {data_path} no existe")
 
-    with open(data_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("cursos", [])
-
+# ============================================================================
+# FUNCIONES AUXILIARES DE NORMALIZACIÓN
+# ============================================================================
 
 def normalize_text(text: str) -> str:
+    """Normaliza texto: minúsculas, quita acentos, caracteres especiales y espacios múltiples."""
     if not text:
         return ""
     normalized = text.lower()
@@ -87,14 +110,20 @@ def normalize_text(text: str) -> str:
 
 
 def extract_unique_values(cursos: List[dict], key: str) -> List[str]:
+    """Extrae valores únicos de un campo en la lista de cursos."""
     values = {str(curso.get(key, "")).strip() for curso in cursos if str(curso.get(key, "")).strip()}
     return sorted(values, key=lambda item: item.lower())
 
 
+# ============================================================================
+# FUNCIONES DE DETECCIÓN DE INTENCIÓN
+# ============================================================================
+
 def detect_exact_category(query: str, categories: List[str]) -> Optional[str]:
+    """Detecta si la query menciona explícitamente una categoría exacta."""
     query_norm = normalize_text(query)
     
-    # Mapeo inteligente de raíces verbales o sinónimos comunes para robustez
+    # Mapeo inteligente de raíces verbales o sinónimos comunes
     raiz_map = {
         "cocin": "cocina",
         "bord": "bordado",
@@ -121,9 +150,7 @@ def detect_exact_category(query: str, categories: List[str]) -> Optional[str]:
 
 
 def detect_explicit_public(query: str) -> Optional[str]:
-    """
-    Detecta si el usuario está pidiendo un público específico en su frase.
-    """
+    """Detecta si el usuario está pidiendo un público específico en su frase."""
     query_norm = normalize_text(query)
     tokens = set(query_norm.split())
 
@@ -142,6 +169,7 @@ def detect_explicit_public(query: str) -> Optional[str]:
 
 
 def course_belongs_to_category(curso: dict, categoria: str) -> bool:
+    """Verifica si un curso pertenece a una categoría exacta."""
     course_value = normalize_text(curso.get("categoria", ""))
     expected = normalize_text(categoria)
     if not course_value or not expected:
@@ -151,8 +179,8 @@ def course_belongs_to_category(curso: dict, categoria: str) -> bool:
 
 def course_matches_label(curso: dict, query_text: str, field: str) -> bool:
     """
-    Compara de forma normalizada y con soporte de alias si el curso
-    hace match con lo que el usuario está buscando en su query.
+    Compara normalizado si el curso hace match con lo que el usuario busca en un campo específico.
+    Soporta aliases inteligentes (ej: "niño" → "infantil").
     """
     if not query_text:
         return False
@@ -164,13 +192,12 @@ def course_matches_label(curso: dict, query_text: str, field: str) -> bool:
     query_norm = normalize_text(query_text)
     course_norm = normalize_text(course_value)
 
-    # Match directo normalizado (ej: "adultos" en "cursos para adultos")
     if course_norm in query_norm:
         return True
 
     query_tokens = set(query_norm.split())
     
-    # Diccionario unificado de equivalencias (Mapea lo que escribe el usuario al valor del JSON)
+    # Diccionario de equivalencias: lo que escribe el usuario ↔ valor del JSON
     alias_map = {
         "nino": "infantil", "ninos": "infantil", "nina": "infantil", "ninas": "infantil",
         "nene": "infantil", "nenes": "infantil", "nena": "infantil", "nenas": "infantil",
@@ -187,7 +214,6 @@ def course_matches_label(curso: dict, query_text: str, field: str) -> bool:
         if token in alias_map:
             expanded_query_tokens.add(alias_map[token])
 
-    # El valor del curso también lo pasamos por el mapa por si acaso
     course_tokens = set(course_norm.split())
     normalized_course_tokens = set()
     for token in course_tokens:
@@ -198,51 +224,210 @@ def course_matches_label(curso: dict, query_text: str, field: str) -> bool:
     return bool(expanded_query_tokens & normalized_course_tokens)
 
 
-def generar_embeddings_separados(cursos: List[dict]) -> tuple[np.ndarray, np.ndarray]:
-    titulos = [str(curso.get("titulo", "")).strip() for curso in cursos]
-    descripciones = [str(curso.get("descripcion", "")).strip() for curso in cursos]
+# ============================================================================
+# FUNCIONES DE GESTIÓN QDRANT
+# ============================================================================
 
-    logger.info("Generando embeddings separados para título y descripción...")
-    embeddings_titulo_local = model.encode(titulos, convert_to_numpy=True)
-    embeddings_descripcion_local = model.encode(descripciones, convert_to_numpy=True)
-    return embeddings_titulo_local, embeddings_descripcion_local
+def initialize_qdrant_collection() -> None:
+    """Inicializa la colección Qdrant 'cursos_hobby' si no existe."""
+    try:
+        collections = qdrant_client.get_collections()
+        collection_names = [col.name for col in collections.collections]
+        
+        if COLLECTION_NAME not in collection_names:
+            logger.info(f"Creando colección '{COLLECTION_NAME}' en Qdrant...")
+            qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config={
+                    TITLE_VECTOR_NAME: models.VectorParams(
+                        size=VECTOR_SIZE,
+                        distance=models.Distance.COSINE
+                    ),
+                    DESCRIPTION_VECTOR_NAME: models.VectorParams(
+                        size=VECTOR_SIZE,
+                        distance=models.Distance.COSINE
+                    )
+                }
+            )
+            logger.info(f"Colección '{COLLECTION_NAME}' creada exitosamente.")
+        else:
+            logger.info(f"Colección '{COLLECTION_NAME}' ya existe.")
+    except Exception as exc:
+        logger.error(f"Error al inicializar colección Qdrant: {exc}", exc_info=True)
+        raise
 
 
-def calcular_similitud(query_embedding: np.ndarray, embeddings_field: np.ndarray) -> np.ndarray:
-    query_reshaped = query_embedding.reshape(1, -1)
-    return cosine_similarity(query_reshaped, embeddings_field)[0]
+def upsert_courses_to_qdrant(cursos: List[dict]) -> None:
+    """
+    Inserta/actualiza cursos en Qdrant con embeddings de título y descripción.
+    Cada punto tiene dos vectores named: titulo_vector y descripcion_vector.
+    """
+    if not cursos:
+        logger.warning("No hay cursos para insertar en Qdrant.")
+        return
+    
+    try:
+        logger.info(f"Generando embeddings para {len(cursos)} cursos...")
+        
+        titulos = [str(curso.get("titulo", "")).strip() for curso in cursos]
+        descripciones = [str(curso.get("descripcion", "")).strip() for curso in cursos]
+        
+        embeddings_titulo = model.encode(titulos, convert_to_numpy=True)
+        embeddings_descripcion = model.encode(descripciones, convert_to_numpy=True)
+        
+        logger.info("Preparando puntos para Qdrant...")
+        points = []
+        
+        for idx, curso in enumerate(cursos):
+            punto = models.PointStruct(
+                id=curso["id"],
+                vector={
+                    TITLE_VECTOR_NAME: embeddings_titulo[idx].tolist(),
+                    DESCRIPTION_VECTOR_NAME: embeddings_descripcion[idx].tolist()
+                },
+                payload={
+                    "id": curso["id"],
+                    "titulo": curso.get("titulo", ""),
+                    "descripcion": curso.get("descripcion", ""),
+                    "barrio": curso.get("barrio", ""),
+                    "categoria": curso.get("categoria", ""),
+                    "nivel": curso.get("nivel", ""),
+                    "publico": curso.get("publico", ""),
+                    "precio": curso.get("precio", 0),
+                    "modalidad_pago": curso.get("modalidad_pago", ""),
+                    "valoracion": curso.get("valoracion", 0.0),
+                    "coordenadas": curso.get("coordenadas", {}),
+                    "docente": curso.get("docente", ""),
+                    "whatsapp": curso.get("whatsapp", ""),
+                    "instagram": curso.get("instagram", "")
+                }
+            )
+            points.append(punto)
+        
+        logger.info(f"Insertando {len(points)} puntos en Qdrant...")
+        qdrant_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=points
+        )
+        logger.info(f"Insertados {len(points)} cursos en Qdrant exitosamente.")
+        
+    except Exception as exc:
+        logger.error(f"Error al insertar cursos en Qdrant: {exc}", exc_info=True)
+        raise
 
+
+def cargar_datos() -> List[dict]:
+    """Carga datos de cursos desde data.json."""
+    data_path = Path(__file__).parent / "data.json"
+    if not data_path.exists():
+        raise FileNotFoundError(f"El archivo {data_path} no existe")
+
+    with open(data_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("cursos", [])
+
+
+# ============================================================================
+# EVENTOS DE CICLO DE VIDA
+# ============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    global cursos_data, model, categorias_disponibles, embeddings_titulo, embeddings_descripcion
+    """Inicializa el servidor: conexión a Qdrant, carga de datos, embeddings."""
+    global qdrant_client, model, cursos_data, categorias_disponibles
+    
+    max_retries = 5
+    retry_delay = 2
+    
     try:
         logger.info("Iniciando servidor...")
+        
+        # 1. Conectar a Qdrant con reintentos
+        logger.info(f"Conectando a Qdrant en {QDRANT_HOST}:{QDRANT_PORT}...")
+        for attempt in range(max_retries):
+            try:
+                qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+                # Verificar conectividad
+                qdrant_client.get_collections()
+                logger.info("✓ Conexión a Qdrant exitosa.")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Intento {attempt + 1}/{max_retries} fallido: {e}. Reintentando en {retry_delay}s...")
+                    import time
+                    time.sleep(retry_delay)
+                else:
+                    raise
+        
+        # 2. Cargar modelo SentenceTransformer
+        logger.info("Cargando modelo de embeddings 'all-MiniLM-L6-v2'...")
         model = SentenceTransformer("all-MiniLM-L6-v2")
+        logger.info("✓ Modelo cargado.")
+        
+        # 3. Cargar datos desde data.json
+        logger.info("Cargando datos de cursos desde data.json...")
         cursos_data = cargar_datos()
+        logger.info(f"✓ {len(cursos_data)} cursos cargados.")
+        
+        # 4. Extraer categorías disponibles
         categorias_disponibles = extract_unique_values(cursos_data, "categoria")
-        embeddings_titulo, embeddings_descripcion = generar_embeddings_separados(cursos_data)
-        logger.info("Servidor iniciado correctamente")
+        logger.info(f"✓ Categorías disponibles: {categorias_disponibles}")
+        
+        # 5. Inicializar colección Qdrant
+        initialize_qdrant_collection()
+        
+        # 6. Insertar cursos en Qdrant
+        upsert_courses_to_qdrant(cursos_data)
+        
+        logger.info("✓ Servidor iniciado correctamente.")
+        
     except Exception as exc:
         logger.critical(f"Error fatal al iniciar servidor: {exc}", exc_info=True)
         raise
 
 
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "cursos_cargados": len(cursos_data)}
+    """Verifica el estado del servidor."""
+    try:
+        collections = qdrant_client.get_collections()
+        qdrant_status = "ok"
+    except Exception:
+        qdrant_status = "error"
+    
+    return {
+        "status": "ok",
+        "cursos_cargados": len(cursos_data),
+        "qdrant": qdrant_status,
+        "modelo": "all-MiniLM-L6-v2"
+    }
 
 
 @app.post("/api/search")
-async def buscar_cursos(request: SearchRequest, sort: Optional[str] = Query(None, description="Campo para ordenar: 'similitud' o 'valoracion'")):
+async def buscar_cursos(
+    request: SearchRequest,
+    sort: Optional[str] = Query(None, description="Campo para ordenar: 'similitud' o 'valoracion'")
+):
+    """
+    Busca cursos con pipeline híbrido:
+    1. Extrae intención (categoría + público explícito)
+    2. Busca en Qdrant con vectores de título y descripción
+    3. Aplica ponderación asimétrica (70% título, 30% descripción)
+    4. Aplica soft boosting (infantil +20%, inicial +10%)
+    5. Ordena por similitud o valoración
+    """
     try:
-        if not cursos_data or embeddings_titulo is None or embeddings_descripcion is None or model is None:
+        if not qdrant_client or not model or not cursos_data:
             raise HTTPException(status_code=503, detail="El servidor no está completamente inicializado")
 
         query = request.query.strip().lower()
         logger.info(f"Búsqueda recibida: '{query}'")
 
-        # 1. Extracción de intención (Categoría y Público)
+        # ===== PASO 1: EXTRACCIÓN DE INTENCIÓN =====
         categoria_exacta = detect_exact_category(query, categorias_disponibles)
         intent_publico = detect_explicit_public(query)
 
@@ -251,50 +436,130 @@ async def buscar_cursos(request: SearchRequest, sort: Optional[str] = Query(None
         if intent_publico:
             logger.info(f"Filtro estricto de PÚBLICO detectado: {intent_publico}")
 
-        # 2. Pipeline Semántico
-        query_embedding = model.encode(query, convert_to_numpy=True)
-        sim_titulo_scores = calcular_similitud(query_embedding, embeddings_titulo)
-        sim_descripcion_scores = calcular_similitud(query_embedding, embeddings_descripcion)
+        # ===== PASO 2: BÚSQUEDA EN QDRANT =====
+        logger.info("Generando embedding de query...")
+        query_embedding = model.encode(query, convert_to_numpy=True).tolist()
+
+        # Construir filtro Qdrant si hay categoría exacta detectada
+        qdrant_filter = None
+        if categoria_exacta:
+            qdrant_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="categoria",
+                        match=models.MatchValue(value=categoria_exacta)
+                    )
+                ]
+            )
+            logger.info(f"Aplicando filtro duro de categoría: {categoria_exacta}")
+
+        # Búsqueda en vector de título
+        logger.info("Buscando por similitud de título...")
+        search_results_titulo = qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=models.NamedVector(
+                name=TITLE_VECTOR_NAME,
+                vector=query_embedding
+            ),
+            query_filter=qdrant_filter,
+            limit=100,  # Traemos más para aplicar filtros posteriores
+            with_payload=True
+        )
+
+        # Búsqueda en vector de descripción
+        logger.info("Buscando por similitud de descripción...")
+        search_results_descripcion = qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=models.NamedVector(
+                name=DESCRIPTION_VECTOR_NAME,
+                vector=query_embedding
+            ),
+            query_filter=qdrant_filter,
+            limit=100,
+            with_payload=True
+        )
+
+        # ===== PASO 3: CONSOLIDAR RESULTADOS CON PONDERACIÓN ASIMÉTRICA =====
+        # Crear diccionarios para acceso rápido
+        scores_titulo = {result.id: result.score for result in search_results_titulo}
+        scores_descripcion = {result.id: result.score for result in search_results_descripcion}
+
+        # Todos los IDs únicos encontrados
+        all_ids = set(scores_titulo.keys()) | set(scores_descripcion.keys())
 
         resultados = []
-        for index, curso in enumerate(cursos_data):
-            
-            # HARD FILTER 1: Si hay categoría explícita y el curso no pertenece, se descarta.
-            if categoria_exacta and not course_belongs_to_category(curso, categoria_exacta):
-                continue
+        for course_id in all_ids:
+            sim_titulo = scores_titulo.get(course_id, 0.0)
+            sim_descripcion = scores_descripcion.get(course_id, 0.0)
 
-            # HARD FILTER 2 (CORREGIDO): Si se detectó intención de público, usamos course_matches_label.
-            # Si el curso NO coincide con el público pedido por el usuario, se descarta inmediatamente.
-            if intent_publico and not course_matches_label(curso, query, "publico"):
-                continue
-
-            sim_titulo = float(sim_titulo_scores[index])
-            sim_descripcion = float(sim_descripcion_scores[index])
+            # Ponderación asimétrica
             score_base = (sim_titulo * TITLE_WEIGHT) + (sim_descripcion * DESCRIPTION_WEIGHT)
 
-            # 3. Soft Boosting para atributos de nivel restante (ej: "inicial")
+            # Escudo de ruido: descartar si similitud de título es muy baja
+            # (solo si NO hay categoría o público explícito detectado)
+            if not categoria_exacta and not intent_publico and sim_titulo < MIN_TITLE_SIMILARITY:
+                continue
+
+            # Obtener payload del curso (usamos el primero disponible)
+            payload = None
+            if course_id in scores_titulo:
+                for result in search_results_titulo:
+                    if result.id == course_id:
+                        payload = result.payload
+                        break
+            if payload is None and course_id in scores_descripcion:
+                for result in search_results_descripcion:
+                    if result.id == course_id:
+                        payload = result.payload
+                        break
+
+            if payload is None:
+                continue
+
+            # ===== PASO 4: SOFT BOOSTING =====
             boost = 1.0
-            if course_matches_label(curso, query, "nivel"):
+            
+            # Boost para público infantil
+            if course_matches_label(payload, query, "publico"):
+                boost += 0.20
+            
+            # Boost para nivel inicial
+            if course_matches_label(payload, query, "nivel"):
                 boost += 0.10
 
             score_final = score_base * boost
 
-            # ESCUDO DE RUIDO: Solo actúa si el usuario NO buscó una categoría ni un público explícito.
-            # Si el usuario escribió "infantil", confiamos plenamente en la lógica dura del Hard Filter 2.
-            if not categoria_exacta and not intent_publico and sim_titulo < MIN_TITLE_SIMILARITY:
+            # ===== PASO 5: HARD FILTER POR PÚBLICO (si se detectó explícitamente) =====
+            if intent_publico and not course_matches_label(payload, query, "publico"):
                 continue
 
-            item = dict(curso)
-            item["similarity_score"] = round(score_final, 4)
-            item["debug_sim_titulo"] = round(sim_titulo, 2)
+            # Mapear payload a CursoResponse
+            item = {
+                "id": int(payload.get("id", 0)),
+                "titulo": payload.get("titulo", ""),
+                "descripcion": payload.get("descripcion", ""),
+                "barrio": payload.get("barrio", ""),
+                "coordenadas": payload.get("coordenadas", {}),
+                "precio": float(payload.get("precio", 0)),
+                "modalidad_pago": payload.get("modalidad_pago", ""),
+                "valoracion": float(payload.get("valoracion", 0.0)),
+                "similarity_score": round(score_final, 4)
+            }
             resultados.append(item)
 
+        # ===== PASO 6: ORDENAMIENTO =====
         if sort == "valoracion":
             resultados.sort(key=lambda item: item.get("valoracion", 0), reverse=True)
         else:
             resultados.sort(key=lambda item: item.get("similarity_score", 0.0), reverse=True)
 
-        return {"query": query, "total_resultados": len(resultados), "cursos": resultados}
+        logger.info(f"Búsqueda completada: {len(resultados)} resultados.")
+        
+        return SearchResponse(
+            query=query,
+            total_resultados=len(resultados),
+            cursos=resultados
+        )
 
     except HTTPException:
         raise
@@ -302,6 +567,10 @@ async def buscar_cursos(request: SearchRequest, sort: Optional[str] = Query(None
         logger.error(f"Error en búsqueda: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error interno: {str(exc)}")
 
+
+# ============================================================================
+# PUNTO DE ENTRADA
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
