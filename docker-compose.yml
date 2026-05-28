@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.0
+    container_name: hobby_vector_db
+    ports:
+      - "6333:6333"  # REST API y comunicación con el backend
+      - "6334:6334"  # gRPC
+    volumes:
+      - qdrant_storage:/qdrant/storage  # Persistencia de los vectores localmente Usar named volume
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    environment:
+      - QDRANT_HTTP_STACKTRACE=true
+
+  backend:
+    build: .
+    container_name: hobby_backend_api
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - RELOAD=${RELOAD:-false}  # Controla reload con variable
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: >
+      sh -c "if [ $$RELOAD = 'true' ]; then 
+             uvicorn main:app --host 0.0.0.0 --port 8000 --reload; 
+             else 
+             uvicorn main:app --host 0.0.0.0 --port 8000; 
+             fi"
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: on-failure:3
+    develop:  # ← Hot-reload eficiente (Docker Compose v2.22+)
+      watch:
+        - path: ./
+          action: sync
+          target: /app
+
+volumes:
+  qdrant_storage:
+    driver: local
