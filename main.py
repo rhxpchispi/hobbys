@@ -455,34 +455,30 @@ async def buscar_cursos(
 
         # Búsqueda en vector de título
         logger.info("Buscando por similitud de título...")
-        search_results_titulo = qdrant_client.search(
+        search_results_titulo = qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=models.NamedVector(
-                name=TITLE_VECTOR_NAME,
-                vector=query_embedding
-            ),
+            query=query_embedding,
             query_filter=qdrant_filter,
+            using=TITLE_VECTOR_NAME,
             limit=100,  # Traemos más para aplicar filtros posteriores
             with_payload=True
         )
 
         # Búsqueda en vector de descripción
         logger.info("Buscando por similitud de descripción...")
-        search_results_descripcion = qdrant_client.search(
+        search_results_descripcion = qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=models.NamedVector(
-                name=DESCRIPTION_VECTOR_NAME,
-                vector=query_embedding
-            ),
+            query=query_embedding,
             query_filter=qdrant_filter,
+            using=DESCRIPTION_VECTOR_NAME,
             limit=100,
             with_payload=True
         )
 
         # ===== PASO 3: CONSOLIDAR RESULTADOS CON PONDERACIÓN ASIMÉTRICA =====
         # Crear diccionarios para acceso rápido
-        scores_titulo = {result.id: result.score for result in search_results_titulo}
-        scores_descripcion = {result.id: result.score for result in search_results_descripcion}
+        scores_titulo = {result.id: result.score for result in search_results_titulo.points}
+        scores_descripcion = {result.id: result.score for result in search_results_descripcion.points}
 
         # Todos los IDs únicos encontrados
         all_ids = set(scores_titulo.keys()) | set(scores_descripcion.keys())
@@ -503,12 +499,12 @@ async def buscar_cursos(
             # Obtener payload del curso (usamos el primero disponible)
             payload = None
             if course_id in scores_titulo:
-                for result in search_results_titulo:
+                for result in search_results_titulo.points:
                     if result.id == course_id:
                         payload = result.payload
                         break
             if payload is None and course_id in scores_descripcion:
-                for result in search_results_descripcion:
+                for result in search_results_descripcion.points:
                     if result.id == course_id:
                         payload = result.payload
                         break

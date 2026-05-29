@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copia y compila dependencias
 COPY requirements.txt .
-RUN pip install --user --no-cache-dir --upgrade pip setuptools \
+RUN pip install --user --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --user --no-cache-dir -r requirements.txt
 
 # Stage 2: Runtime
@@ -30,12 +30,12 @@ COPY --chown=appuser:appuser . .
 # Configura PATH para pip packages instalados con --user
 ENV PATH=/home/appuser/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_INPUT=1
 
 # Cambia a usuario no-root
 USER appuser
 
 EXPOSE 8000
 
-# CMD: ejecuta la app (importante para que docker-compose funcione)
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
