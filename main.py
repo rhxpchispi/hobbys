@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -45,6 +45,9 @@ class CursoResponse(BaseModel):
     precio: float
     modalidad_pago: str
     valoracion: float
+    docente: Optional[str] = None
+    whatsapp: Optional[str] = None
+    instagram: Optional[str] = None
     similarity_score: Optional[float] = None
 
 
@@ -539,6 +542,9 @@ async def buscar_cursos(
                 "precio": float(payload.get("precio", 0)),
                 "modalidad_pago": payload.get("modalidad_pago", ""),
                 "valoracion": float(payload.get("valoracion", 0.0)),
+                "docente": payload.get("docente", ""),
+                "whatsapp": payload.get("whatsapp", ""),
+                "instagram": payload.get("instagram", ""),
                 "similarity_score": round(score_final, 4)
             }
             resultados.append(item)
