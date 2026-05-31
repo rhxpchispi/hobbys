@@ -155,7 +155,7 @@ hobbys/
 
 ## Datos de cursos
 
-Los cursos viven en `backend/data.json`. Al iniciar, el backend:
+Los cursos viven en `backend/data.json`. Al iniciar el backend:
 
 1. Carga el JSON
 2. Crea o reutiliza la colección `cursos_hobby` en Qdrant
