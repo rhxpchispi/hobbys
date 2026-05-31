@@ -175,3 +175,52 @@ docker compose logs -f backend
 # Build de producción del frontend (sin Docker)
 cd frontend && npm run build && npm run preview
 ```
+
+## Repositorios Git
+
+Este proyecto es un **monorepo** en [github.com/rhxpchispi/hobbys](https://github.com/rhxpchispi/hobbys) (backend + frontend + Docker).
+
+El directorio `frontend/` también se publica en [github.com/rhxpchispi/hobbys-fe](https://github.com/rhxpchispi/hobbys-fe) como respaldo del frontend aislado. La sincronización se hace con **git subtree**.
+
+### Remotes recomendados
+
+```bash
+git remote -v
+# origin    → hobbys (monorepo completo)
+# hobbys-fe → hobbys-fe (solo frontend)
+```
+
+Si falta el remote del frontend:
+
+```bash
+git remote add hobbys-fe https://github.com/rhxpchispi/hobbys-fe.git
+```
+
+### Flujo de trabajo habitual
+
+**1. Trabajás en el monorepo** (rama `mvp` u otra):
+
+```bash
+# Cambios en frontend/, backend/ o raíz
+git add .
+git commit -m "tu mensaje"
+git push origin mvp
+```
+
+**2. Publicás solo el frontend en hobbys-fe:**
+
+```bash
+git subtree push --prefix=frontend hobbys-fe main
+```
+
+**3. Si editaste directamente en hobbys-fe** y querés traer esos cambios al monorepo:
+
+```bash
+git subtree pull --prefix=frontend hobbys-fe main --squash
+```
+
+### Notas
+
+- El monorepo contiene los archivos de `frontend/` directamente (no es un submódulo).
+- No uses un `.git/` anidado dentro de `frontend/`; rompe el tracking del monorepo.
+- `git subtree push` puede tardar en el primer push; reescribe el historial filtrado de `frontend/`.

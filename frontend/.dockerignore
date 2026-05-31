@@ -1,0 +1,33 @@
+# Excluir dependencias locales; se instalan dentro del contenedor de build
+node_modules
+
+# Artefactos de compilación previos (Vite genera dist/ en el Stage 1)
+dist
+dist-ssr
+
+# Control de versiones (no necesario en la imagen)
+.git
+.gitignore
+
+# Variables de entorno locales con secretos o overrides de desarrollo
+.env
+.env.*
+!.env.example
+
+# Logs y cachés de herramientas
+*.log
+npm-debug.log*
+.npm
+.eslintcache
+
+# Metadatos de editores e IDE
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# Documentación y archivos de CI (no afectan el build)
+README.md
+*.md
+.github

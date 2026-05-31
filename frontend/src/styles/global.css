@@ -1,0 +1,78 @@
+:root {
+  --color-primary: #4285f4;
+  --color-text: #202124;
+  --color-text-muted: #70757a;
+  --color-bg: #ffffff;
+  --color-border: #dfe1e5;
+  --color-surface-muted: #f8f9fa;
+  --header-height: 80px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: 'Noto Sans', system-ui, sans-serif;
+  color: var(--color-text);
+  background: var(--color-bg);
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app--results {
+  /* header fijo + panel deslizable */
+}
+
+/* Search bar (global BEM en SearchBar.tsx) */
+.searchBar {
+  width: 100%;
+}
+
+.searchBar__input {
+  width: 100%;
+  padding: 14px 20px;
+  font-size: 16px;
+  font-family: inherit;
+  border: 1px solid var(--color-border);
+  border-radius: 24px;
+  outline: none;
+  color: var(--color-text);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.searchBar__input:hover,
+.searchBar__input:focus {
+  box-shadow: 0 1px 6px rgba(32, 33, 36, 0.28);
+  border-color: transparent;
+}
+
+.searchBar--compact .searchBar__input {
+  padding: 10px 18px;
+  font-size: 15px;
+}
+
+/* Leaflet popup — contenido mínimo */
+.leaflet-popup-content {
+  margin: 10px 12px;
+  line-height: 1.4;
+}
+
+.leaflet-popup-content p {
+  margin: 0;
+}
