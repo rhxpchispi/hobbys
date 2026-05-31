@@ -1,75 +1,100 @@
-version: '3.8'
+# =============================================================================
+# docker-compose.yml — Ecosistema Hobbys (Qdrant + Backend FastAPI + Frontend)
+# =============================================================================
+# Uso:
+#   docker compose up --build -d
+#   Abrir http://localhost en el navegador
+# =============================================================================
 
 services:
+  # ---------------------------------------------------------------------------
+  # Qdrant — Base de datos vectorial
+  # ---------------------------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:v1.13.0
-    container_name: hobby_vector_db
+    image: qdrant/qdrant:v1.13.2
+    container_name: hobbys-qdrant
+    restart: unless-stopped
     ports:
-      - "6333:6333"  # REST API y comunicación con el backend
-      - "6334:6334"  # gRPC
+      # Exponer solo si necesitás acceder desde fuera de Docker (debug/admin)
+      - "6333:6333"
     volumes:
-      - qdrant_storage:/qdrant/storage  # Persistencia de los vectores localmente Usar named volume
-    restart: always
+      # Persistencia de colecciones e índices vectoriales
+      - qdrant_data:/qdrant/storage
+    networks:
+      - hobbys-network
     healthcheck:
-      ## test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/readyz"]
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '1'
-          memory: 1G
-    environment:
-      - QDRANT_HTTP_STACKTRACE=true
+      start_period: 20s
 
+  # ---------------------------------------------------------------------------
+  # Backend — FastAPI (Python)
+  # ---------------------------------------------------------------------------
   backend:
-    build: .
-    container_name: hobby_backend_api
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hobbys-backend
+    restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
-      - RELOAD=${RELOAD:-false}  # Controla reload con variable
+      # URL interna de Qdrant (nombre del servicio Docker, no localhost)
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      CORS_ORIGINS: "http://localhost,http://localhost:80,http://127.0.0.1"
     depends_on:
       qdrant:
-        ##condition: service_healthy
         condition: service_started
-    volumes:
-      - .:/app
-    command: >
-      sh -c "if [ $$RELOAD = 'true' ]; then 
-             uvicorn main:app --host 0.0.0.0 --port 8000 --reload; 
-             else 
-             uvicorn main:app --host 0.0.0.0 --port 8000; 
-             fi"
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 1G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
+    networks:
+      - hobbys-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Frontend — SPA React (Vite) + Nginx
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Vite inyecta esta variable en build time (opcional si usás rutas relativas /api)
+        VITE_API_BASE_URL: /api
+    container_name: hobbys-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      # Resolución DNS interna: http://backend:8000
+      - hobbys-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ > /dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
-    restart: on-failure:3
-    develop:  # ← Hot-reload eficiente (Docker Compose v2.22+)
-      watch:
-        - path: ./
-          action: sync
-          target: /app
+      start_period: 10s
 
+# =============================================================================
+# Redes
+# =============================================================================
+networks:
+  hobbys-network:
+    driver: bridge
+    name: hobbys-network
+
+# =============================================================================
+# Volúmenes
+# =============================================================================
 volumes:
-  qdrant_storage:
-    driver: local
+  qdrant_data:
+    name: hobbys-qdrant-data
