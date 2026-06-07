@@ -83,6 +83,7 @@ categorias_disponibles: List[str] = []
 
 # Configuración Qdrant (lee desde variables de entorno)
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
 COLLECTION_NAME = "cursos_hobby"
 VECTOR_SIZE = 384  # all-MiniLM-L6-v2 dimension
@@ -349,7 +350,7 @@ async def startup_event():
         logger.info(f"Conectando a Qdrant en {QDRANT_HOST}:{QDRANT_PORT}...")
         for attempt in range(max_retries):
             try:
-                qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+                qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
                 # Verificar conectividad
                 qdrant_client.get_collections()
                 logger.info("✓ Conexión a Qdrant exitosa.")
