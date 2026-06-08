@@ -98,6 +98,38 @@ TITLE_VECTOR_NAME = "titulo_vector"
 DESCRIPTION_VECTOR_NAME = "descripcion_vector"
 
 
+def create_qdrant_client() -> QdrantClient:
+    """
+    Crea el cliente Qdrant usando variables de entorno.
+    Soporta un fallback local para desarrollo y hosts remotos para Qdrant Cloud.
+    """
+    if QDRANT_HOST.startswith(("http://", "https://")):
+        return QdrantClient(url=QDRANT_HOST.rstrip("/"), api_key=QDRANT_API_KEY)
+
+    return QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
+
+
+def get_qdrant_point_count() -> int:
+    """Retorna el conteo actual de puntos en la colección configurada."""
+    count_result = qdrant_client.count(collection_name=COLLECTION_NAME)
+    return int(count_result.count)
+
+
+def bootstrap_qdrant_collection(cursos: List[dict]) -> None:
+    """
+    Inicializa la colección, creando la colección si no existe y populando los datos
+    únicamente cuando la colección está vacía.
+    """
+    initialize_qdrant_collection()
+    current_count = get_qdrant_point_count()
+
+    if current_count == 0:
+        logger.info(f"Colección '{COLLECTION_NAME}' vacía. Insertando datos iniciales...")
+        upsert_courses_to_qdrant(cursos)
+    else:
+        logger.info(f"Colección '{COLLECTION_NAME}' ya contiene {current_count} puntos; no se reinsertan datos.")
+
+
 # ============================================================================
 # FUNCIONES AUXILIARES DE NORMALIZACIÓN
 # ============================================================================
@@ -350,7 +382,7 @@ async def startup_event():
         logger.info(f"Conectando a Qdrant en {QDRANT_HOST}:{QDRANT_PORT}...")
         for attempt in range(max_retries):
             try:
-                qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
+                qdrant_client = create_qdrant_client()
                 # Verificar conectividad
                 qdrant_client.get_collections()
                 logger.info("✓ Conexión a Qdrant exitosa.")
@@ -362,29 +394,25 @@ async def startup_event():
                     time.sleep(retry_delay)
                 else:
                     raise
-        
+
         # 2. Cargar modelo SentenceTransformer
         logger.info("Cargando modelo de embeddings 'all-MiniLM-L6-v2'...")
         model = SentenceTransformer("all-MiniLM-L6-v2")
         logger.info("✓ Modelo cargado.")
-        
+
         # 3. Cargar datos desde data.json
         logger.info("Cargando datos de cursos desde data.json...")
         cursos_data = cargar_datos()
         logger.info(f"✓ {len(cursos_data)} cursos cargados.")
-        
+
         # 4. Extraer categorías disponibles
         categorias_disponibles = extract_unique_values(cursos_data, "categoria")
         logger.info(f"✓ Categorías disponibles: {categorias_disponibles}")
-        
-        # 5. Inicializar colección Qdrant
-        initialize_qdrant_collection()
-        
-        # 6. Insertar cursos en Qdrant
-        upsert_courses_to_qdrant(cursos_data)
-        
+
+        # 5. Inicializar colección Qdrant y poblar solo una vez si está vacía
+        bootstrap_qdrant_collection(cursos_data)
         logger.info("✓ Servidor iniciado correctamente.")
-        
+
     except Exception as exc:
         logger.critical(f"Error fatal al iniciar servidor: {exc}", exc_info=True)
         raise

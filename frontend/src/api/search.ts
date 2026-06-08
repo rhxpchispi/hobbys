@@ -1,6 +1,7 @@
 import type { SearchRequest, SearchResponse } from '../types/course'
 
-const SEARCH_ENDPOINT = '/api/search'
+const API_BASE_URL = import.meta.env.VITE_API_URL?.trim().replace(/\/$/, "") ?? ""
+const SEARCH_ENDPOINT = `${API_BASE_URL || ""}/api/search`
 
 export class SearchApiError extends Error {
   constructor(
